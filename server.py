@@ -22,10 +22,10 @@ UPLOAD_DIR = 'uploads'
 INCOMPLETE_DIR = 'incomplete'
 BACKLOG = 5
 TCP_TIMEOUT = 30
-UDP_TIMEOUT = 0.002
-WINDOW_SIZE = 1000
+UDP_TIMEOUT = 0.05
+WINDOW_SIZE = 2000
 retries = 0
-MAX_RETRIES = 30
+MAX_RETRIES = 50
 COMPLETION_WAIT = 5.0
 
 def setup_keepalive(sock):
@@ -300,7 +300,7 @@ class UDPServer:
 
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
-        ACK_EVERY = 128
+        ACK_EVERY = 512
         last_acked = expected_seq
 
         print(f"[UDP upload] receiving {total_packets} packets")
@@ -340,7 +340,7 @@ class UDPServer:
             # финальные ACK
             for _ in range(5):
                 self.send_ack(expected_seq)
-                time.sleep(0.001)
+                time.sleep(0.002)
 
         elapsed = time.time() - start_time
         speed = filesize / elapsed / 1024 if elapsed > 0 else 0

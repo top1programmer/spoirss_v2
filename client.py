@@ -14,9 +14,9 @@ UDP_BUFFER_SIZE = 1472          # 1500 - 28 (IP+UDP) = 1472
 UDP_HEADER_SIZE = 4
 UDP_DATA_SIZE = UDP_BUFFER_SIZE - UDP_HEADER_SIZE
 TIMEOUT = 300
-UDP_TIMEOUT = 0.002                # увеличен для реальных сетей
-MAX_RETRIES = 3
-WINDOW_SIZE = 1000                 # уменьшенное окно
+UDP_TIMEOUT = 0.05              # увеличен для реальных сетей
+MAX_RETRIES = 50
+WINDOW_SIZE = 2000                 # уменьшенное окно
 MAX_TOTAL_RETRIES = 30
 
 class UDPClient:
@@ -78,7 +78,7 @@ class UDPClient:
                         batch.clear()
                     
                     if next_seq % 200 == 0:
-                        time.sleep(0.001)
+                        time.sleep(0.0005)
 
                 #  дослать остаток batch
                 if batch:
@@ -154,7 +154,7 @@ class UDPClient:
         MAX_RETRIES = 50
         retries = 0
 
-        ACK_EVERY = 100
+        ACK_EVERY = 512
         last_acked = base
 
         start_time = time.time()
