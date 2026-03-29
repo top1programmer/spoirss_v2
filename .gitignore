@@ -1,0 +1,12 @@
+**/*.zip
+**/*.rar
+**/*.7z
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.gz
+**/*.bz2
+**/*.xz
+spolks_linux_vmsis_2013-2014/**
+**/incomplete/
+**/uploads/
