@@ -31,8 +31,8 @@ class UDPClient:
         pack = struct.Struct('!I').pack
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
+        #BATCH_SIZE = 128
         batch = []
-        BATCH_SIZE = 32   # ⚠️ уменьшили (64 часто фризит UDP)
 
         retries = 0
         MAX_RETRIES = 50
@@ -46,7 +46,7 @@ class UDPClient:
             while last_ack < total_packets - 1:
 
                 # -------------------------
-                # 1. SENDING WINDOW
+                # SEND WINDOW
                 # -------------------------
                 while next_seq < base + WINDOW_SIZE and next_seq < total_packets:
                     data = f.read(UDP_DATA_SIZE)
@@ -61,36 +61,46 @@ class UDPClient:
                             self.sock.sendto(pkt, self.addr)
                         batch.clear()
 
+                # flush
                 for pkt in batch:
                     self.sock.sendto(pkt, self.addr)
                 batch.clear()
 
                 # -------------------------
-                # 2. ACK (ВАЖНО — 1 попытка)
+                # ACK DRAIN (ВАЖНО)
                 # -------------------------
-                try:
-                    ack_data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                got_ack = False
 
-                    if ack_data.startswith(b'ACK '):
-                        try:
-                            ack_seq = int(ack_data[4:])
-                        except:
-                            continue
+                while True:
+                    try:
+                        ack_data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    except socket.timeout:
+                        break
 
-                        if ack_seq > last_ack:
-                            last_ack = ack_seq
-                            base = ack_seq
-                            retries = 0
-                            last_progress = time.time()
+                    if not ack_data.startswith(b'ACK '):
+                        continue
 
-                except socket.timeout:
+                    try:
+                        ack_seq = int(ack_data[4:].strip())
+                    except:
+                        continue
+
+                    if ack_seq > last_ack:
+                        last_ack = ack_seq
+                        base = ack_seq
+                        retries = 0
+                        last_progress = time.time()
+                        got_ack = True
+
+                # -------------------------
+                # TIMEOUT → RESEND
+                # -------------------------
+                if not got_ack:
                     retries += 1
 
-                    # resend НЕМНОГО, не всё окно
-                    resend_end = min(base + 100, total_packets)
+                    resend_end = min(base + WINDOW_SIZE // 2, total_packets)
 
                     f.seek(base * UDP_DATA_SIZE)
-
                     for seq in range(base, resend_end):
                         data = f.read(UDP_DATA_SIZE)
                         if not data:
@@ -100,7 +110,7 @@ class UDPClient:
                     next_seq = max(next_seq, resend_end)
 
                 # -------------------------
-                # 3. FAIL SAFE
+                # FAIL SAFE
                 # -------------------------
                 if retries > MAX_RETRIES:
                     print("[UDP upload] too many retries → abort")
@@ -111,12 +121,8 @@ class UDPClient:
                     return None
 
         elapsed = time.time() - start_time
-
-        if elapsed <= 0:
-            return None
-
-        return filesize / elapsed / 1024
-
+        return filesize / elapsed / 1024 if elapsed > 0 else None
+        
     def receive_file(self, filename, filesize, offset=0):
         base = offset // UDP_DATA_SIZE
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
@@ -127,7 +133,7 @@ class UDPClient:
         MAX_RETRIES = 50
         retries = 0
 
-        ACK_EVERY = 512
+        #ACK_EVERY = 128
         last_acked = base
 
         start_time = time.time()
@@ -138,30 +144,38 @@ class UDPClient:
 
             while base < total_packets:
                 try:
-                    data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    got_data = False
 
-                    if len(data) < 4:
-                        continue
+                    while True:
+                        try:
+                            data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                        except socket.timeout:
+                            break
 
-                    seq = struct.unpack('!I', data[:4])[0]
-                    payload = data[4:]
+                        got_data = True
 
-                    if seq not in received:
-                        received[seq] = payload
+                        if len(data) < 4:
+                            continue
 
-                    advanced = False
+                        seq = struct.unpack('!I', data[:4])[0]
+                        payload = data[4:]
 
-                    while base in received:
-                        f.write(received.pop(base))
-                        base += 1
-                        advanced = True
+                        if seq not in received:
+                            received[seq] = payload
 
-                    # ACK батчами
+                        while base in received:
+                            f.write(received.pop(base))
+                            base += 1
+
+                    # ACK
                     if base - last_acked >= ACK_EVERY:
                         self.sock.sendto(f"ACK {base}".encode(), self.addr)
                         last_acked = base
 
-                    retries = 0
+                    if got_data:
+                        retries = 0
+                    else:
+                        raise socket.timeout
 
                 except socket.timeout:
                     retries += 1
@@ -169,7 +183,6 @@ class UDPClient:
                     if retries > MAX_RETRIES:
                         raise TimeoutError("UDP download failed (too many retries)")
 
-                    # при timeout всегда просим
                     self.sock.sendto(f"ACK {base}".encode(), self.addr)
                     last_acked = base
 
@@ -177,7 +190,7 @@ class UDPClient:
         for _ in range(3):
             try:
                 self.sock.sendto(f"ACK {base}".encode(), self.addr)
-                time.sleep(0.001)
+                time.sleep(0.0005)
             except:
                 pass
 

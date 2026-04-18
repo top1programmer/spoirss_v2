@@ -41,10 +41,14 @@ class UDPServer:
     def handle_upload(self, args):
         self.update_activity()
 
-        parts = shlex.split(args)
-        filename = parts[0]
-        filesize = int(parts[1])
-        offset = int(parts[2]) if len(parts) > 2 else 0
+        try:
+            parts = shlex.split(args)
+            filename = parts[0]
+            filesize = int(parts[1])
+            offset = int(parts[2]) if len(parts) > 2 else 0
+        except:
+            self.send_error("invalid args")
+            return
 
         os.makedirs(INCOMPLETE_DIR, exist_ok=True)
         os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -61,11 +65,19 @@ class UDPServer:
         expected_seq = offset // UDP_DATA_SIZE
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
+        # ответ клиенту
         self.send_ok(str(expected_seq))
 
-        last_ack = expected_seq
-
         print(f"[UDP upload] receiving {total_packets} packets")
+
+        # 🔥 буфер полученных пакетов (ключевая вещь)
+        received = {}
+
+        last_ack = expected_seq
+        last_progress = time.time()
+
+        #ACK_EVERY = 128
+        STALL_TIMEOUT = 15
 
         with open(temp_path, 'ab') as f:
             f.seek(offset)
@@ -83,26 +95,39 @@ class UDPServer:
                     seq = struct.unpack('!I', data[:4])[0]
                     payload = data[4:]
 
-                    # -----------------------
-                    # IN ORDER ONLY
-                    # -----------------------
-                    if seq == expected_seq:
-                        f.write(payload)
+                    # сохраняем пакет
+                    if seq not in received:
+                        received[seq] = payload
+
+                    # 🔥 продвигаем окно (главное исправление)
+                    advanced = False
+                    while expected_seq in received:
+                        f.write(received.pop(expected_seq))
                         expected_seq += 1
+                        advanced = True
+
+                    if advanced:
+                        last_progress = time.time()
                         self.update_activity()
 
-                    # всегда ACK текущее ожидаемое
-                    if expected_seq - last_ack >= 256:
+                    # 🔥 ACK батчами
+                    if expected_seq - last_ack >= ACK_EVERY:
                         self.send_ack(expected_seq)
                         last_ack = expected_seq
 
                 except socket.timeout:
-                    # keep alive ACK
+                    # keep-alive ACK
                     self.send_ack(expected_seq)
 
-        # финальные ACK
-        for _ in range(3):
+                # 🔥 защита от зависания
+                if time.time() - last_progress > STALL_TIMEOUT:
+                    print("[UDP upload] stalled → abort")
+                    return
+
+        # 🔥 финальные ACK (чтобы клиент точно получил)
+        for _ in range(10):
             self.send_ack(expected_seq)
+            time.sleep(0.001)
 
         try:
             os.rename(temp_path, final_path)
@@ -144,7 +169,7 @@ class UDPServer:
         MAX_RETRIES = 50
         retries = 0
 
-        BATCH_SIZE = 64
+        #BATCH_SIZE = 128
         batch = []
         pack = struct.Struct('!I').pack
 
@@ -172,7 +197,7 @@ class UDPServer:
                             for pkt in batch:
                                 self.sock.sendto(pkt, self.client_addr)
                             batch.clear()
-                            time.sleep(0.001)
+                            time.sleep(0.0005)
 
                     next_seq += 1
 
@@ -186,7 +211,10 @@ class UDPServer:
                     ack_data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
 
                     if addr == self.client_addr and ack_data.startswith(b'ACK '):
-                        ack_seq = int(ack_data[4:].strip())
+                        try:
+                            ack_seq = int(ack_data[4:].strip())
+                        except:
+                            continue
 
                         if ack_seq > base:
                             while base < ack_seq:
@@ -210,7 +238,7 @@ class UDPServer:
                                 for pkt in batch:
                                     self.sock.sendto(pkt, self.client_addr)
                                 batch.clear()
-                                time.sleep(0.001)
+                                time.sleep(0.0005)
 
                     for pkt in batch:
                         self.sock.sendto(pkt, self.client_addr)
