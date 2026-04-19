@@ -22,11 +22,9 @@ class UDPServer:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)
         except Exception:
             pass
-
         snd = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
         rcv = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         print("SO_SNDBUF =", snd, "SO_RCVBUF =", rcv)
-        
 
     def update_activity(self):
         self.last_activity = time.time()
@@ -40,7 +38,8 @@ class UDPServer:
 
     def send_ack(self, seq):
         try:
-            self.sock.sendto(f"ACK {seq}".encode(), self.client_addr)
+            self.sock.sendto(struct.pack('!I', seq), self.client_addr)
+            #self.sock.sendto(f"ACK {seq}".encode(), self.client_addr)
         except Exception:
             pass
 
@@ -87,21 +86,18 @@ class UDPServer:
         current_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
 
         if current_size != offset:
-            # сообщаем ожидаемое смещение в байтах
             self.send_error(f"expected offset {current_size}")
             return
 
         expected_seq = offset // UDP_DATA_SIZE
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
-        # ответ клиенту: ACK OK <expected_seq>
         self.send_ok(str(expected_seq))
-
-        print(f"[UDP upload] receiving {total_packets} packets from {self.client_addr}")
 
         received = {}
         last_ack = expected_seq
         last_progress = time.time()
+
         STALL_TIMEOUT = 30
 
         with open(temp_path, 'ab') as raw:
@@ -110,43 +106,48 @@ class UDPServer:
 
             while expected_seq < total_packets:
                 try:
-                    r, _, _ = select.select([self.sock], [], [], UDP_TIMEOUT)
-                    if not r:
-                        # keepalive ACK to inform client of current base
-                        self.send_ack(expected_seq)
-                    else:
-                        data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    # 🔥 БЕЗ select — просто читаем всё что есть
+                    for _ in range(1024):  # ограничиваем burst
+                        try:
+                            data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                        except BlockingIOError:
+                            break
+                        except socket.timeout:
+                            break
+
                         if addr != self.client_addr:
-                            # игнорируем пакеты от других адресов
                             continue
+
                         if len(data) < 4:
                             continue
+
                         seq = struct.unpack('!I', data[:4])[0]
                         payload = data[4:]
+
                         if seq not in received:
                             received[seq] = payload
 
-                        advanced = False
-                        while expected_seq in received:
-                            buf.write(received.pop(expected_seq))
-                            expected_seq += 1
-                            advanced = True
+                    advanced = False
 
-                        if advanced:
-                            last_progress = time.time()
-                            self.update_activity()
+                    while expected_seq in received:
+                        buf.write(received.pop(expected_seq))
+                        expected_seq += 1
+                        advanced = True
 
-                        # кумулятивный ACK каждые ACK_EVERY пакетов
-                        if expected_seq - last_ack >= ACK_EVERY:
-                            self.send_ack(expected_seq)
-                            last_ack = expected_seq
+                    if advanced:
+                        last_progress = time.time()
+                        self.update_activity()
 
-                except socket.timeout:
-                    # keepalive ACK
+                    # 🔥 бинарный ACK
+                    if expected_seq - last_ack >= ACK_EVERY:
+                        self.send_ack(expected_seq)
+                        last_ack = expected_seq
+
+                    # 🔥 keepalive ACK
                     self.send_ack(expected_seq)
+
                 except Exception as e:
                     print(f"[UDP upload] exception: {e}")
-                    self.send_error("server error")
                     buf.flush()
                     return
 
@@ -155,8 +156,7 @@ class UDPServer:
                     buf.flush()
                     return
 
-            # финальные ACK несколько раз
-            for _ in range(6):
+            for _ in range(5):
                 self.send_ack(expected_seq)
                 time.sleep(0.001)
 
@@ -165,15 +165,12 @@ class UDPServer:
         try:
             os.replace(temp_path, final_path)
         except Exception:
-            # если не удалось переименовать — оставить в incomplete
             pass
 
         try:
             self.sock.sendto(b"UPLOAD complete", self.client_addr)
         except Exception:
             pass
-
-        print(f"[UDP upload] finished for {self.client_addr}")
 
     def handle_download(self, args):
         self.update_activity()
@@ -189,7 +186,6 @@ class UDPServer:
                 return
 
             filesize = os.path.getsize(filepath)
-            # ответ: ACK OK <filesize> <offset>
             self.send_ok(f"{filesize} {offset}")
 
         except Exception:
@@ -202,10 +198,15 @@ class UDPServer:
         base = start_seq
         next_seq = start_seq
 
-        sent_packets = {}
         retries = 0
-        batch = []
-        pack = struct.Struct('!I').pack
+        last_progress = time.time()
+
+        # 🔥 cache окна
+        window_cache = {}
+
+        # 🔥 единый буфер
+        packet_buf = bytearray(UDP_HEADER_SIZE + UDP_DATA_SIZE)
+        mv = memoryview(packet_buf)
 
         print(f"[UDP download] start to {self.client_addr}: {total_packets} packets")
 
@@ -214,85 +215,79 @@ class UDPServer:
             start_time = time.time()
 
             while base < total_packets:
-                # отправка окна
+
+                # ================= SEND =================
                 while next_seq < base + WINDOW_SIZE and next_seq < total_packets:
-                    if next_seq not in sent_packets:
+                    if next_seq not in window_cache:
                         data = f.read(UDP_DATA_SIZE)
                         if not data:
                             break
-                        packet = pack(next_seq) + data
-                        sent_packets[next_seq] = packet
-                        batch.append(packet)
+
+                        struct.pack_into('!I', packet_buf, 0, next_seq)
+                        mv[UDP_HEADER_SIZE:UDP_HEADER_SIZE+len(data)] = data
+
+                        pkt = bytes(mv[:UDP_HEADER_SIZE + len(data)])
+                        window_cache[next_seq] = pkt
+
+                    self.sock.sendto(window_cache[next_seq], self.client_addr)
                     next_seq += 1
 
-                    if len(batch) >= BATCH_SIZE:
-                        for pkt in batch:
-                            self.sock.sendto(pkt, self.client_addr)
-                        batch.clear()
-
-                # flush остатка
-                for pkt in batch:
-                    self.sock.sendto(pkt, self.client_addr)
-                batch.clear()
-
-                # ожидание ACKs ограниченно через select
+                # ================= RECV ACK (как upload) =================
                 got_ack = False
-                drain_deadline = time.time() + 0.01
-                while time.time() < drain_deadline:
-                    r, _, _ = select.select([self.sock], [], [], max(0, drain_deadline - time.time()))
-                    if not r:
-                        break
+
+                for _ in range(512):
                     try:
                         ack_data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    except BlockingIOError:
+                        break
                     except socket.timeout:
                         break
+
                     if addr != self.client_addr:
                         continue
-                    try:
-                        text = ack_data.decode('utf-8', errors='ignore').strip()
-                    except:
+
+                    # 🔥 ТОЛЬКО бинарный ACK
+                    if len(ack_data) != 4:
                         continue
-                    if not text.startswith('ACK'):
-                        continue
-                    # извлекаем последнее число в ACK как seq
-                    parts = text.split()
-                    seq_val = None
-                    for p in parts[::-1]:
-                        try:
-                            seq_val = int(p)
-                            break
-                        except:
-                            continue
-                    if seq_val is None:
-                        continue
-                    ack_seq = seq_val
+
+                    ack_seq = struct.unpack('!I', ack_data)[0]
+
                     if ack_seq > base:
                         while base < ack_seq:
-                            sent_packets.pop(base, None)
+                            window_cache.pop(base, None)
                             base += 1
+
                         retries = 0
+                        last_progress = time.time()
                         got_ack = True
 
+                # ================= RETRANSMIT =================
                 if not got_ack:
                     retries += 1
-                    # resend часть окна
-                    resend_end = min(base + max(1, WINDOW_SIZE // 2), next_seq)
+
+                    resend_end = min(base + 32, next_seq)
+
                     for seq in range(base, resend_end):
-                        pkt = sent_packets.get(seq)
+                        pkt = window_cache.get(seq)
                         if pkt:
                             self.sock.sendto(pkt, self.client_addr)
 
-                    time.sleep(min(0.01 * (1.5 ** retries), 0.5))
+                if retries > MAX_RETRIES:
+                    print("[!] UDP download aborted (too many retries)")
+                    return
 
-                    if retries > MAX_RETRIES:
-                        print("[!] UDP download aborted (too many retries)")
-                        return
+                if time.time() - last_progress > 30:
+                    print("[!] UDP download stalled")
+                    return
 
             elapsed = time.time() - start_time
             speed = (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
 
             try:
-                self.sock.sendto(f"DOWNLOAD complete. Speed: {speed:.0f} KB/s".encode(), self.client_addr)
+                self.sock.sendto(
+                    f"DOWNLOAD complete. Speed: {speed:.0f} KB/s".encode(),
+                    self.client_addr
+                )
             except Exception:
                 pass
 
@@ -366,14 +361,14 @@ def udp_server_loop(sock, current_client, handler, is_busy):
         return current_client, handler, False
 
     # Обработка ACK-пакетов
-    if cmd_line.startswith("ACK "):
-        if handler and addr == current_client:
-            try:
-                seq = int(cmd_line[4:].strip())
-                handler.handle_ack(seq)
-            except:
-                pass
-        return current_client, handler, False
+    #if cmd_line.startswith("ACK "):
+    if handler and addr == current_client:
+        try:
+            seq = int(cmd_line[4:].strip())
+            handler.handle_ack(seq)
+        except:
+            pass
+    #    return current_client, handler, False
 
     # Если пришла команда от того же клиента, но сессия завершена, начинаем новую
     if handler and handler.completed and addr == current_client:
@@ -416,3 +411,4 @@ def udp_server_loop(sock, current_client, handler, is_busy):
         sock.sendto(b"ACK ERROR BUSY (another UDP client)", addr)
         print(f"[!] Rejected UDP client {addr} (busy with another UDP client)")
         return current_client, handler, False
+

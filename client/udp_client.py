@@ -238,22 +238,19 @@ class UDPClient:
         base = offset // UDP_DATA_SIZE
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
-        received = {}
-        mode = 'ab' if offset > 0 else 'wb'
+        # 🔥 ring buffer вместо dict
+        received = [None] * WINDOW_SIZE
 
-        MAX_RETRIES_LOCAL = MAX_RETRIES
         retries = 0
-
         last_acked = base
+        last_progress = time.time()
 
         start_time = time.time()
-        self.sock.settimeout(UDP_TIMEOUT)
 
-        # диагностика
         packets_received = 0
         bytes_payload_recv = 0
 
-        with open(filename, mode) as f:
+        with open(filename, 'ab' if offset else 'wb') as f:
             import io
             buf = io.BufferedWriter(f, buffer_size=BUFFER_SIZE)
             f.seek(offset)
@@ -261,14 +258,12 @@ class UDPClient:
             while base < total_packets:
                 got_data = False
 
-                # batch drain с select
-                drain_deadline = time.time() + 0.01
-                while time.time() < drain_deadline:
-                    r, _, _ = select.select([self.sock], [], [], max(0, drain_deadline - time.time()))
-                    if not r:
-                        break
+                # 🔥 быстрый drain без select
+                for _ in range(512):
                     try:
                         data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    except BlockingIOError:
+                        break
                     except socket.timeout:
                         break
 
@@ -278,51 +273,69 @@ class UDPClient:
                     seq = struct.unpack('!I', data[:4])[0]
                     payload = data[4:]
 
-                    if seq not in received:
-                        received[seq] = payload
+                    # 🔥 ограничиваем только текущим окном
+                    if seq < base or seq >= base + WINDOW_SIZE:
+                        continue
+
+                    idx = seq % WINDOW_SIZE
+
+                    if received[idx] is None:
+                        received[idx] = payload
                         packets_received += 1
                         bytes_payload_recv += len(payload)
 
-                    advanced = False
-                    while base in received:
-                        buf.write(received.pop(base))
-                        base += 1
-                        advanced = True
+                    # 🔥 продвигаем окно максимально быстро
+                    while True:
+                        idx_base = base % WINDOW_SIZE
+                        chunk = received[idx_base]
 
-                    if advanced:
+                        if chunk is None:
+                            break
+
+                        buf.write(chunk)
+                        received[idx_base] = None
+                        base += 1
                         got_data = True
 
-                # кумулятивный ACK
-                if base - last_acked >= ACK_EVERY or not got_data:
+                # ================= ACK batching =================
+                if base - last_acked >= 32:
                     try:
-                        self.sock.sendto(f"ACK {base}".encode(), self.addr)
+                        self.sock.sendto(struct.pack('!I', base), self.addr)
                         last_acked = base
                     except Exception:
                         pass
 
+                # ================= RETRY =================
                 if got_data:
                     retries = 0
+                    last_progress = time.time()
                 else:
                     retries += 1
+
+                    # 🔥 keepalive ACK
                     try:
-                        self.sock.sendto(f"ACK {base}".encode(), self.addr)
-                        last_acked = base
+                        self.sock.sendto(struct.pack('!I', base), self.addr)
                     except Exception:
                         pass
 
-                    if retries > MAX_RETRIES_LOCAL:
-                        raise TimeoutError("UDP download failed (too many retries)")
+                    if retries > MAX_RETRIES:
+                        raise TimeoutError("UDP download failed")
 
-            # финальные ACK
+                # 🔥 защита от зависания
+                if time.time() - last_progress > 30:
+                    raise TimeoutError("UDP download stalled")
+
+            # 🔥 финальные ACK
             for _ in range(3):
                 try:
-                    self.sock.sendto(f"ACK {base}".encode(), self.addr)
-                    time.sleep(0.001)
-                except:
+                    self.sock.sendto(struct.pack('!I', base), self.addr)
+                except Exception:
                     pass
 
             buf.flush()
 
         elapsed = time.time() - start_time
+
         print(f"[UDP download] packets_received={packets_received} bytes_payload={bytes_payload_recv}")
+
         return (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
