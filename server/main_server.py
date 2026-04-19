@@ -49,6 +49,14 @@ def main():
     # --- UDP ---
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)
+    except Exception:
+        pass
+
+    print(udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
+      udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
     udp_sock.bind(('0.0.0.0', args.port))
     udp_sock.setblocking(False)
 
