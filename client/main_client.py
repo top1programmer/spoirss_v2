@@ -1,246 +1,279 @@
+# client/main_client.py
 #!/usr/bin/env python3
-#client/main_client.py
-from tcp_client import *
-from udp_client import UDPClient
-from common.config import *
-import socket
 import argparse
 import os
-import sys
 import shlex
+import socket
+import sys
 import time
 
-def parse_server_offset(resp_text, filesize):
-    """
-    Возвращает ожидаемое сервером смещение в байтах или None.
-    Правила:
-      - если в тексте есть 'offset' или 'expected' — берём ближайшее число к этому слову (байты)
-      - если есть два числа — считаем (filesize, offset)
-      - если одно число <= total_packets => seq -> bytes = seq * UDP_DATA_SIZE
-      - иначе число интерпретируем как байты
-    """
-    if not resp_text:
-        return None
+from common.config import *
+from tcp_client import *
+from udp_client import UDPClient
 
-    txt = resp_text.lower()
-    parts = txt.replace(',', ' ').split()
-    nums = []
-    for p in parts:
-        try:
-            nums.append(int(p))
-        except:
-            continue
 
-    total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Клиент для передачи файлов'
+    )
 
-    # 1) ключевые слова
-    if 'offset' in parts or 'expected' in parts:
-        # найти ближайшее число к слову 'offset' или 'expected'
-        for i, token in enumerate(parts):
-            if token in ('offset', 'expected'):
-                # ищем число справа, затем слева
-                for j in range(i+1, min(i+6, len(parts))):
-                    try:
-                        return int(parts[j])
-                    except:
-                        continue
-                for j in range(i-1, max(i-6, -1), -1):
-                    try:
-                        return int(parts[j])
-                    except:
-                        continue
-        # fallback: если не нашли рядом — взять последнее число
-        if nums:
-            return nums[-1]
+    parser.add_argument(
+        '--protocol',
+        choices=['tcp', 'udp'],
+        default='tcp'
+    )
 
-    # 2) два числа -> filesize, offset
-    if len(nums) >= 2:
-        # если первый примерно равен filesize (или близко) — второй это offset
-        if abs(nums[0] - filesize) < 1024*1024 or nums[0] == filesize:
-            return nums[1]
-        # иначе, если второй <= total_packets -> seq
-        if nums[1] <= total_packets:
-            return nums[1] * UDP_DATA_SIZE
-        return nums[1]
+    parser.add_argument(
+        'action',
+        choices=['upload', 'download', 'echo', 'time', 'close']
+    )
 
-    # 3) одно число
-    if len(nums) == 1:
-        n = nums[0]
-        if 0 <= n <= total_packets:
-            return n * UDP_DATA_SIZE
-        return n
+    parser.add_argument('filename', nargs='?')
+    parser.add_argument('--host', default=HOST)
+    parser.add_argument('--port', type=int, default=PORT)
 
-    return None
+    return parser.parse_args()
 
-def main():
-    parser = argparse.ArgumentParser(description='Клиент для передачи файлов')
-    parser.add_argument('--protocol', choices=['tcp', 'udp'], default='tcp',
-                        help='Протокол передачи (tcp или udp)')
-    parser.add_argument('action', choices=['upload', 'download', 'echo', 'time', 'close'],
-                        help='Действие')
-    parser.add_argument('filename', nargs='?', help='Имя файла (для upload/download)')
-    parser.add_argument('--host', default=HOST, help='Адрес сервера')
-    parser.add_argument('--port', type=int, default=PORT, help='Порт сервера')
-    args = parser.parse_args()
 
-    print("CWD =", os.getcwd())
-    print("FILE =", args.filename)
-    print("EXISTS =", os.path.exists(args.filename) if args.filename else None)
-
+def require_filename(args):
     if args.action in ('upload', 'download') and not args.filename:
         print("Для upload/download необходимо указать имя файла")
         sys.exit(1)
 
+
+def create_tcp_socket(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(TCP_TIMEOUT)
+
+    try:
+        sock.connect((host, port))
+    except Exception as e:
+        print("TCP connection failed:", e)
+        sys.exit(1)
+
+    return sock
+
+
+def create_udp_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 2**20)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 2**20)
+    except Exception:
+        pass
+
+    sock.settimeout(UDP_TIMEOUT)
+    sock.setblocking(False)
+
+    return sock
+
+
+def create_socket(args):
     if args.protocol == 'tcp':
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TCP_TIMEOUT)
+        return create_tcp_socket(args.host, args.port)
+
+    return create_udp_socket()
+
+
+def ensure_file_exists(path):
+    if os.path.exists(path):
+        return
+
+    print("File not found")
+    sys.exit(1)
+
+
+def local_download_name(filename):
+    return 'downloaded_' + os.path.basename(filename)
+
+
+def file_size(path):
+    if os.path.exists(path):
+        return os.path.getsize(path)
+
+    return 0
+
+
+# ==========================================================
+# TCP
+# ==========================================================
+def handle_tcp(args, sock):
+    if args.action == 'echo':
+        handle_tcp_echo(sock, args.filename)
+        return
+
+    if args.action == 'time':
+        handle_tcp_time(sock)
+        return
+
+    if args.action == 'close':
+        handle_tcp_close(sock)
+        return
+
+    if args.action == 'upload':
+        handle_tcp_upload(sock, args.filename)
+        return
+
+    if args.action == 'download':
+        handle_tcp_download(sock, args.filename)
+
+
+def handle_tcp_echo(sock, text):
+    cmd = f"ECHO {text}" if text else "ECHO"
+    sock.sendall((cmd + '\n').encode())
+    print(recv_line_tcp(sock))
+
+
+def handle_tcp_time(sock):
+    sock.sendall(b"TIME\n")
+    print(recv_line_tcp(sock))
+
+
+def handle_tcp_close(sock):
+    sock.sendall(b"CLOSE\n")
+    print(recv_line_tcp(sock))
+
+
+def handle_tcp_upload(sock, filename):
+    ensure_file_exists(filename)
+    upload_tcp(sock, filename, os.path.getsize(filename), 0)
+
+
+def handle_tcp_download(sock, filename):
+    offset = file_size(local_download_name(filename))
+    download_tcp(sock, filename, offset)
+
+
+# ==========================================================
+# UDP
+# ==========================================================
+def handle_udp(args, sock):
+    client = UDPClient(sock, (args.host, args.port))
+
+    if args.action == 'upload':
+        handle_udp_upload(client, args.filename)
+        return
+
+    if args.action == 'download':
+        handle_udp_download(client, args.filename)
+        return
+
+    print("UDP поддерживает только upload/download")
+
+
+def handle_udp_upload(client, filename):
+    ensure_file_exists(filename)
+
+    filesize = os.path.getsize(filename)
+    offset = 0
+
+    cmd = build_upload_cmd(filename, filesize, offset)
+    resp = request_udp(client, cmd)
+
+    server_offset = parse_server_offset(resp, filesize)
+
+    if server_offset is None:
+        print("Cannot parse server response:", resp)
+        sys.exit(1)
+
+    if server_offset != offset:
+        print(f"[INFO] resume from {server_offset}")
+        offset = server_offset
+
+    speed = client.send_file(filename, filesize, offset)
+    print(f"UDP upload finished. Speed: {speed:.2f} KB/s")
+
+
+def handle_udp_download(client, filename):
+    local_name = local_download_name(filename)
+    offset = file_size(local_name)
+
+    cmd = build_download_cmd(filename, offset)
+    resp = request_udp(client, cmd)
+
+    filesize, server_offset = parse_download_response(resp)
+
+    if filesize is None:
+        print("Cannot parse server response:", resp)
+        sys.exit(1)
+
+    if server_offset != offset:
+        print(f"[INFO] resume from {server_offset}")
+        offset = server_offset
+
+    speed = client.receive_file(local_name, filesize, offset)
+    print(f"UDP download finished. Speed: {speed:.2f} KB/s")
+
+
+def build_upload_cmd(filename, filesize, offset):
+    name = shlex.quote(os.path.basename(filename))
+    return f"UPLOAD {name} {filesize} {offset}"
+
+
+def build_download_cmd(filename, offset):
+    name = shlex.quote(os.path.basename(filename))
+    return f"DOWNLOAD {name} {offset}"
+
+
+def request_udp(client, cmd):
+    try:
+        return client.send_command(cmd)
+    except Exception as e:
+        print("Server error:", e)
+        sys.exit(1)
+
+
+def parse_download_response(resp):
+    nums = [int(x) for x in resp.replace(',', ' ').split() if x.isdigit()]
+
+    if len(nums) < 2:
+        return None, None
+
+    return nums[0], nums[1]
+
+
+def parse_server_offset(resp_text, filesize):
+    if not resp_text:
+        return None
+
+    nums = []
+
+    for item in resp_text.replace(',', ' ').split():
         try:
-            sock.connect((args.host, args.port))
-        except Exception as e:
-            print(f"TCP connection failed: {e}")
-            sys.exit(1)
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*2**20)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32*2**20)
+            nums.append(int(item))
         except Exception:
             pass
-        sock.settimeout(UDP_TIMEOUT)
-        sock.setblocking(False)
+
+    if not nums:
+        return None
+
+    total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
+    value = nums[-1]
+
+    if 0 <= value <= total_packets:
+        return value * UDP_DATA_SIZE
+
+    return value
+
+
+# ==========================================================
+# main
+# ==========================================================
+def main():
+    args = parse_args()
+    require_filename(args)
+
+    sock = create_socket(args)
 
     try:
         if args.protocol == 'tcp':
-            if args.action == 'echo':
-                cmd = f"ECHO {args.filename}" if args.filename else "ECHO"
-                sock.sendall((cmd + '\n').encode())
-                resp = recv_line_tcp(sock)
-                print(resp)
-            elif args.action == 'time':
-                sock.sendall(b"TIME\n")
-                resp = recv_line_tcp(sock)
-                print(resp)
-            elif args.action == 'close':
-                sock.sendall(b"CLOSE\n")
-                resp = recv_line_tcp(sock)
-                print(resp)
-            elif args.action == 'upload':
-                if not os.path.exists(args.filename):
-                    print("File not found")
-                    sys.exit(1)
-                filesize = os.path.getsize(args.filename)
-                offset = 0
-                upload_tcp(sock, args.filename, filesize, offset)
-            elif args.action == 'download':
-                local_filename = 'downloaded_' + os.path.basename(args.filename)
-                offset = os.path.getsize(local_filename) if os.path.exists(local_filename) else 0
-                download_tcp(sock, args.filename, offset)
+            handle_tcp(args, sock)
         else:
-            udp_client = UDPClient(sock, (args.host, args.port))
-            if args.action == 'echo':
-                resp = udp_client.send_command(f"ECHO {args.filename}" if args.filename else "ECHO")
-                print(resp)
-            elif args.action == 'time':
-                resp = udp_client.send_command("TIME")
-                print(resp)
-            elif args.action == 'close':
-                resp = udp_client.send_command("CLOSE")
-                print(resp)
-            elif args.action == 'upload':
-                if not os.path.exists(args.filename):
-                    print("File not found")
-                    sys.exit(1)
-                filesize = os.path.getsize(args.filename)
-                offset = 0
-
-                # initial UPLOAD command and server response
-                cmd = f"UPLOAD {shlex.quote(os.path.basename(args.filename))} {filesize} {offset}"
-                try:
-                    resp = udp_client.send_command(cmd)
-                except Exception as e:
-                    print("Server error (no response):", e)
-                    sys.exit(1)
-
-                print("[DEBUG] server response:", resp)
-                server_offset = parse_server_offset(resp, filesize)
-
-                # retry once if parsing failed
-                if server_offset is None:
-                    try:
-                        time.sleep(0.1)
-                        resp2 = udp_client.send_command(cmd)
-                        print("[DEBUG] server response retry:", resp2)
-                        server_offset = parse_server_offset(resp2, filesize)
-                    except Exception:
-                        server_offset = None
-
-                if server_offset is None:
-                    print("[ERROR] cannot parse server offset, server replied:", resp)
-                    sys.exit(1)
-
-                if server_offset != offset:
-                    print(f"[INFO] resuming from server_offset={server_offset} (client had {offset})")
-                    offset = server_offset
-
-                # start sending file from offset
-                try:
-                    speed = udp_client.send_file(args.filename, filesize, offset)
-                except TimeoutError as e:
-                    print("UDP upload failed:", e)
-                    sys.exit(1)
-                if speed is None:
-                    print("UDP upload failed")
-                    sys.exit(1)
-                print(f"UDP upload finished. Speed: {speed:.2f} KB/s")
-
-            elif args.action == 'download':
-                offset = 0
-                local_filename = 'downloaded_' + os.path.basename(args.filename)
-                if os.path.exists(local_filename):
-                    offset = os.path.getsize(local_filename)
-                cmd = f"DOWNLOAD {shlex.quote(os.path.basename(args.filename))} {offset}"
-                try:
-                    resp = udp_client.send_command(cmd)
-                except Exception as e:
-                    print("Server error (no response):", e)
-                    sys.exit(1)
-                if not resp.upper().startswith('ACK') and not resp.upper().startswith('OK'):
-                    print("Server error:", resp)
-                    sys.exit(1)
-                # try to extract filesize and server offset
-                parts = resp.replace(',', ' ').split()
-                nums = [p for p in parts if p.isdigit()]
-                if len(nums) >= 2:
-                    filesize = int(nums[0])
-                    server_offset = int(nums[1])
-                else:
-                    # fallback: ask again in a clearer format
-                    try:
-                        resp2 = udp_client.send_command(cmd)
-                        parts2 = resp2.replace(',', ' ').split()
-                        nums2 = [p for p in parts2 if p.isdigit()]
-                        if len(nums2) >= 2:
-                            filesize = int(nums2[0])
-                            server_offset = int(nums2[1])
-                        else:
-                            print("Cannot parse server response for download:", resp2)
-                            sys.exit(1)
-                    except Exception as e:
-                        print("Server error (no response):", e)
-                        sys.exit(1)
-
-                if server_offset != offset:
-                    print(f"[INFO] resuming download from server_offset={server_offset} (client had {offset})")
-                    offset = server_offset
-
-                try:
-                    speed = udp_client.receive_file(local_filename, filesize, offset)
-                except Exception as e:
-                    print("UDP download failed:", e)
-                    sys.exit(1)
-                print(f"UDP download finished. Speed: {speed:.2f} KB/s")
+            handle_udp(args, sock)
     finally:
         sock.close()
+
 
 if __name__ == '__main__':
     main()

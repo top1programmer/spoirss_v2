@@ -1,81 +1,71 @@
-# udp_server.py (обновлённый)
-import socket
-import time
-import struct
+# server/udp_server.py
+import io
 import os
 import shlex
-import select
-import io
+import socket
+import struct
+import time
+
 from common.config import *
+
 
 class UDPServer:
     def __init__(self, sock, addr):
         self.sock = sock
         self.client_addr = addr
         self.last_activity = time.time()
-        self.completed = False
-        self.completion_until = 0
+
         self.sock.settimeout(UDP_TIMEOUT)
-        # попытка увеличить системные буферы
+        self.setup_buffers()
+
+    # ==========================================================
+    # common
+    # ==========================================================
+    def setup_buffers(self):
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)
         except Exception:
             pass
-        snd = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
-        rcv = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        print("SO_SNDBUF =", snd, "SO_RCVBUF =", rcv)
 
     def update_activity(self):
         self.last_activity = time.time()
 
-    def mark_completed(self):
-        self.completed = True
-        self.completion_until = time.time() + COMPLETION_WAIT
-
-    def is_completion_expired(self):
-        return self.completed and time.time() > self.completion_until
+    def sendto(self, data):
+        try:
+            self.sock.sendto(data, self.client_addr)
+        except Exception:
+            pass
 
     def send_ack(self, seq):
-        try:
-            self.sock.sendto(struct.pack('!I', seq), self.client_addr)
-            #self.sock.sendto(f"ACK {seq}".encode(), self.client_addr)
-        except Exception:
-            pass
-
-    def send_error(self, msg):
-        try:
-            self.sock.sendto(f"ACK ERROR {msg}".encode(), self.client_addr)
-        except Exception:
-            pass
+        self.sendto(struct.pack('!I', seq))
 
     def send_ok(self, msg=''):
-        try:
-            # формат: "ACK OK <msg>"
-            if msg:
-                self.sock.sendto(f"ACK OK {msg}".encode(), self.client_addr)
-            else:
-                self.sock.sendto(b"ACK OK", self.client_addr)
-        except Exception:
-            pass
+        self.sendto(f"ACK OK {msg}".encode() if msg else b"ACK OK")
 
-    def send_response(self, data):
-        try:
-            self.sock.sendto(f"ACK {data}".encode(), self.client_addr)
-        except Exception:
-            pass
+    def send_error(self, msg):
+        self.sendto(f"ACK ERROR {msg}".encode())
 
+    def recv_packet(self):
+        try:
+            return self.sock.recvfrom(UDP_BUFFER_SIZE)
+        except BlockingIOError:
+            return None
+        except socket.timeout:
+            return None
+
+    def packet_count(self, filesize):
+        return (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
+
+    # ==========================================================
+    # upload
+    # ==========================================================
     def handle_upload(self, args):
-        self.update_activity()
-
-        try:
-            parts = shlex.split(args)
-            filename = parts[0]
-            filesize = int(parts[1])
-            offset = int(parts[2]) if len(parts) > 2 else 0
-        except Exception:
-            self.send_error("invalid args")
+        params = self.parse_upload_args(args)
+        if not params:
             return
+
+        filename, filesize, offset = params
 
         os.makedirs(INCOMPLETE_DIR, exist_ok=True)
         os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -83,332 +73,335 @@ class UDPServer:
         temp_path = os.path.join(INCOMPLETE_DIR, filename)
         final_path = os.path.join(UPLOAD_DIR, filename)
 
-        current_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+        current_size = self.file_size(temp_path)
 
         if current_size != offset:
             self.send_error(f"expected offset {current_size}")
             return
 
         expected_seq = offset // UDP_DATA_SIZE
-        total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
+        total_packets = self.packet_count(filesize)
 
         self.send_ok(str(expected_seq))
 
+        ok = self.receive_upload_file(
+            temp_path,
+            expected_seq,
+            total_packets
+        )
+
+        if not ok:
+            return
+
+        self.finish_upload(temp_path, final_path, filesize)
+
+    def parse_upload_args(self, args):
+        try:
+            parts = shlex.split(args)
+            filename = parts[0]
+            filesize = int(parts[1])
+            offset = int(parts[2]) if len(parts) > 2 else 0
+            return filename, filesize, offset
+        except Exception:
+            self.send_error("invalid args")
+            return None
+
+    def file_size(self, path):
+        if os.path.exists(path):
+            return os.path.getsize(path)
+        return 0
+
+    def receive_upload_file(self, path, expected_seq, total_packets):
         received = {}
-        last_ack = expected_seq
         last_progress = time.time()
 
-        STALL_TIMEOUT = 30
-
-        with open(temp_path, 'ab') as raw:
+        with open(path, 'ab') as raw:
+            raw.seek(expected_seq * UDP_DATA_SIZE)
             buf = io.BufferedWriter(raw, buffer_size=BUFFER_SIZE)
-            raw.seek(offset)
 
             while expected_seq < total_packets:
-                try:
-                    # 🔥 БЕЗ select — просто читаем всё что есть
-                    for _ in range(1024):  # ограничиваем burst
-                        try:
-                            data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
-                        except BlockingIOError:
-                            break
-                        except socket.timeout:
-                            break
+                self.collect_upload_packets(received)
+                new_seq = self.flush_upload_packets(
+                    buf,
+                    received,
+                    expected_seq
+                )
 
-                        if addr != self.client_addr:
-                            continue
+                if new_seq != expected_seq:
+                    expected_seq = new_seq
+                    last_progress = time.time()
+                    self.update_activity()
 
-                        if len(data) < 4:
-                            continue
-
-                        seq = struct.unpack('!I', data[:4])[0]
-                        payload = data[4:]
-
-                        if seq not in received:
-                            received[seq] = payload
-
-                    advanced = False
-
-                    while expected_seq in received:
-                        buf.write(received.pop(expected_seq))
-                        expected_seq += 1
-                        advanced = True
-
-                    if advanced:
-                        last_progress = time.time()
-                        self.update_activity()
-
-                    # 🔥 бинарный ACK
-                    if expected_seq - last_ack >= ACK_EVERY:
-                        self.send_ack(expected_seq)
-                        last_ack = expected_seq
-
-                    # 🔥 keepalive ACK
-                    self.send_ack(expected_seq)
-
-                except Exception as e:
-                    print(f"[UDP upload] exception: {e}")
-                    buf.flush()
-                    return
-
-                if time.time() - last_progress > STALL_TIMEOUT:
-                    print("[UDP upload] stalled → abort")
-                    buf.flush()
-                    return
-
-            for _ in range(5):
                 self.send_ack(expected_seq)
-                time.sleep(0.001)
+
+                if time.time() - last_progress > 30:
+                    print("[UDP upload] stalled")
+                    buf.flush()
+                    return False
 
             buf.flush()
 
+        self.send_final_acks(expected_seq)
+        return True
+
+    def collect_upload_packets(self, received):
+        for _ in range(1024):
+            packet = self.recv_packet()
+
+            if not packet:
+                break
+
+            data, addr = packet
+
+            if addr != self.client_addr:
+                continue
+
+            if len(data) < 4:
+                continue
+
+            seq = struct.unpack('!I', data[:4])[0]
+
+            if seq not in received:
+                received[seq] = data[4:]
+
+    def flush_upload_packets(self, buf, received, expected_seq):
+        while expected_seq in received:
+            buf.write(received.pop(expected_seq))
+            expected_seq += 1
+
+        return expected_seq
+
+    def send_final_acks(self, seq):
+        for _ in range(5):
+            self.send_ack(seq)
+            time.sleep(0.001)
+
+    def finish_upload(self, temp_path, final_path, filesize):
         try:
             os.replace(temp_path, final_path)
         except Exception:
             pass
 
-        try:
-            self.sock.sendto(b"UPLOAD complete", self.client_addr)
-        except Exception:
-            pass
+        self.sendto(b"UPLOAD complete")
+        print(f"[UDP upload] FINISHED {filesize} bytes from {self.client_addr}")
 
+    # ==========================================================
+    # download
+    # ==========================================================
     def handle_download(self, args):
-        self.update_activity()
+        params = self.parse_download_args(args)
+        if not params:
+            return
 
+        filename, offset = params
+        filepath = os.path.join(UPLOAD_DIR, filename)
+
+        if not os.path.exists(filepath):
+            self.send_error("file not found")
+            return
+
+        filesize = os.path.getsize(filepath)
+
+        self.send_ok(f"{filesize} {offset}")
+        self.send_download_file(filepath, filesize, offset)
+
+    def parse_download_args(self, args):
         try:
             parts = shlex.split(args)
             filename = parts[0]
             offset = int(parts[1]) if len(parts) > 1 else 0
-
-            filepath = os.path.join(UPLOAD_DIR, filename)
-            if not os.path.exists(filepath):
-                self.send_error("file not found")
-                return
-
-            filesize = os.path.getsize(filepath)
-            self.send_ok(f"{filesize} {offset}")
-
+            return filename, offset
         except Exception:
             self.send_error("invalid args")
-            return
+            return None
 
+    def send_download_file(self, filepath, filesize, offset):
         start_seq = offset // UDP_DATA_SIZE
-        total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
+        total_packets = self.packet_count(filesize)
 
         base = start_seq
         next_seq = start_seq
-
         retries = 0
         last_progress = time.time()
 
-        # 🔥 cache окна
-        window_cache = {}
-
-        # 🔥 единый буфер
+        cache = {}
         packet_buf = bytearray(UDP_HEADER_SIZE + UDP_DATA_SIZE)
         mv = memoryview(packet_buf)
 
-        print(f"[UDP download] start to {self.client_addr}: {total_packets} packets")
+        start_time = time.time()
 
         with open(filepath, 'rb') as f:
             f.seek(offset)
-            start_time = time.time()
 
             while base < total_packets:
+                next_seq = self.send_window(
+                    f, cache, mv, base, next_seq, total_packets
+                )
 
-                # ================= SEND =================
-                while next_seq < base + WINDOW_SIZE and next_seq < total_packets:
-                    if next_seq not in window_cache:
-                        data = f.read(UDP_DATA_SIZE)
-                        if not data:
-                            break
+                ack = self.read_ack(base)
 
-                        struct.pack_into('!I', packet_buf, 0, next_seq)
-                        mv[UDP_HEADER_SIZE:UDP_HEADER_SIZE+len(data)] = data
-
-                        pkt = bytes(mv[:UDP_HEADER_SIZE + len(data)])
-                        window_cache[next_seq] = pkt
-
-                    self.sock.sendto(window_cache[next_seq], self.client_addr)
-                    next_seq += 1
-
-                # ================= RECV ACK (как upload) =================
-                got_ack = False
-
-                for _ in range(512):
-                    try:
-                        ack_data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
-                    except BlockingIOError:
-                        break
-                    except socket.timeout:
-                        break
-
-                    if addr != self.client_addr:
-                        continue
-
-                    # 🔥 ТОЛЬКО бинарный ACK
-                    if len(ack_data) != 4:
-                        continue
-
-                    ack_seq = struct.unpack('!I', ack_data)[0]
-
-                    if ack_seq > base:
-                        while base < ack_seq:
-                            window_cache.pop(base, None)
-                            base += 1
-
-                        retries = 0
-                        last_progress = time.time()
-                        got_ack = True
-
-                # ================= RETRANSMIT =================
-                if not got_ack:
+                if ack > base:
+                    base = self.slide_window(cache, base, ack)
+                    retries = 0
+                    last_progress = time.time()
+                else:
                     retries += 1
-
-                    resend_end = min(base + 32, next_seq)
-
-                    for seq in range(base, resend_end):
-                        pkt = window_cache.get(seq)
-                        if pkt:
-                            self.sock.sendto(pkt, self.client_addr)
+                    self.resend_window(cache, base, next_seq)
 
                 if retries > MAX_RETRIES:
-                    print("[!] UDP download aborted (too many retries)")
+                    print("[UDP download] aborted")
                     return
 
                 if time.time() - last_progress > 30:
-                    print("[!] UDP download stalled")
+                    print("[UDP download] stalled")
                     return
 
-            elapsed = time.time() - start_time
-            speed = (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
+        elapsed = time.time() - start_time
+        speed = (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
 
-            try:
-                self.sock.sendto(
-                    f"DOWNLOAD complete. Speed: {speed:.0f} KB/s".encode(),
-                    self.client_addr
-                )
-            except Exception:
-                pass
+        self.sendto(
+            f"DOWNLOAD complete. Speed: {speed:.0f} KB/s".encode()
+        )
 
-            print(f"[UDP download] FINISHED {speed:.0f} KB/s for {self.client_addr}")
+        print(
+            f"[UDP download] FINISHED {speed:.0f} KB/s "
+            f"for {self.client_addr}"
+        )
 
-    def handle_echo(self, args):
-        if self.completed:
-            return
-        self.update_activity()
-        if not args:
-            self.send_error("missing argument")
-        else:
-            self.send_response(args)
+    def send_window(self, f, cache, mv, base, next_seq, total):
+        while next_seq < base + WINDOW_SIZE and next_seq < total:
+            if next_seq not in cache:
+                packet = self.build_packet(f, mv, next_seq)
 
-    def handle_time(self):
-        if self.completed:
-            return
-        self.update_activity()
-        current = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.send_response(current)
+                if not packet:
+                    break
 
-    def handle_close(self):
-        if self.completed:
-            return
-        self.update_activity()
-        self.send_response("BYE")
-        return True
+                cache[next_seq] = packet
 
-    def handle_ack(self, seq):
-        if self.completed:
-            return
-        self.update_activity()
-        pass
+            self.sendto(cache[next_seq])
+            next_seq += 1
+
+        return next_seq
+
+    def build_packet(self, f, mv, seq):
+        data = f.read(UDP_DATA_SIZE)
+
+        if not data:
+            return None
+
+        struct.pack_into('!I', mv.obj, 0, seq)
+        mv[UDP_HEADER_SIZE:UDP_HEADER_SIZE + len(data)] = data
+
+        return bytes(mv[:UDP_HEADER_SIZE + len(data)])
+
+    def read_ack(self, base):
+        for _ in range(512):
+            packet = self.recv_packet()
+
+            if not packet:
+                break
+
+            data, addr = packet
+
+            if addr != self.client_addr:
+                continue
+
+            if len(data) != 4:
+                continue
+
+            ack = struct.unpack('!I', data)[0]
+
+            if ack > base:
+                return ack
+
+        return base
+
+    def slide_window(self, cache, base, ack):
+        while base < ack:
+            cache.pop(base, None)
+            base += 1
+
+        return base
+
+    def resend_window(self, cache, base, next_seq):
+        end = min(base + 32, next_seq)
+
+        for seq in range(base, end):
+            packet = cache.get(seq)
+
+            if packet:
+                self.sendto(packet)
+
+    # ==========================================================
+    # loop
+    # ==========================================================
+
+
+def receive_udp(sock):
+    try:
+        return sock.recvfrom(UDP_BUFFER_SIZE)
+    except BlockingIOError:
+        return None
+    except socket.timeout:
+        return None
+    except ConnectionResetError:
+        return None
+
+
+def decode_udp(data):
+    try:
+        return data.decode('utf-8').strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def create_udp_session(sock, addr):
+    print(f"[+] UDP client {addr} started session")
+    return addr, UDPServer(sock, addr)
+
+
+def process_udp_command(handler, cmd, args):
+    if cmd == 'UPLOAD':
+        handler.handle_upload(args)
+        return
+
+    if cmd == 'DOWNLOAD':
+        handler.handle_download(args)
+        return
+
+    handler.send_error("unknown command")
+
 
 def udp_server_loop(sock, current_client, handler, is_busy):
-    # Проверка таймаута неактивности и завершённых сессий
-    if current_client is not None and handler is not None:
-        if handler.is_completion_expired():
-            print(f"[-] UDP client {current_client} completion period expired, freeing session")
-            current_client = None
-            handler = None
-        elif time.time() - handler.last_activity > 10.0:
-            print(f"[-] UDP client {current_client} timed out (inactive)")
-            current_client = None
-            handler = None
+    packet = receive_udp(sock)
 
-    try:
-        data, addr = sock.recvfrom(UDP_BUFFER_SIZE)
-    except socket.timeout:
+    if not packet:
         return current_client, handler, False
-    except BlockingIOError:
-        return current_client, handler, False
-    except ConnectionResetError:
-        if current_client is not None:
-            print(f"[!] UDP client {current_client} reset connection")
-            return None, None, False
-        return current_client, handler, False
+
+    data, addr = packet
 
     if is_busy:
         sock.sendto(b"ACK ERROR BUSY (TCP in progress)", addr)
-        print(f"[!] Rejected UDP client {addr} (TCP busy)")
         return current_client, handler, False
 
-    # Попытка декодировать как UTF-8
-    try:
-        cmd_line = data.decode('utf-8').strip()
-    except UnicodeDecodeError:
-        # Бинарный пакет – обновляем активность, если это текущий клиент
-        if current_client == addr and handler is not None:
-            handler.update_activity()
+    line = decode_udp(data)
+
+    if line is None:
         return current_client, handler, False
 
-    # Обработка ACK-пакетов
-    #if cmd_line.startswith("ACK "):
-    if handler and addr == current_client:
-        try:
-            seq = int(cmd_line[4:].strip())
-            handler.handle_ack(seq)
-        except:
-            pass
-    #    return current_client, handler, False
+    parts = line.split(maxsplit=1)
 
-    # Если пришла команда от того же клиента, но сессия завершена, начинаем новую
-    if handler and handler.completed and addr == current_client:
-        # Завершаем старую сессию и создадим новую
-        current_client = None
-        handler = None
-
-    # Обработка команд
-    print(f"[UDP command] {addr}: {cmd_line}")
-    parts = cmd_line.split(maxsplit=1)
     cmd = parts[0].upper()
     args = parts[1] if len(parts) > 1 else ''
 
-    if current_client is None or addr == current_client:
-        if current_client is None:
-            current_client = addr
-            handler = UDPServer(sock, addr)
-            print(f"[+] UDP client {addr} started session")
-        else:
-            handler.update_activity()
+    if current_client is None:
+        current_client, handler = create_udp_session(sock, addr)
 
-        if cmd in ('CLOSE', 'EXIT', 'QUIT'):
-            handler.handle_close()
-            print(f"[-] UDP client {addr} ended session")
-            return None, None, False
-        elif cmd == 'ECHO':
-            handler.handle_echo(args)
-        elif cmd == 'TIME':
-            handler.handle_time()
-        elif cmd == 'UPLOAD':
-            handler.handle_upload(args)
-            return current_client, handler, False
-        elif cmd == 'DOWNLOAD':
-            handler.handle_download(args)
-            return current_client, handler, False
-        else:
-            handler.send_error("unknown command")
-        return current_client, handler, False
-    else:
+    if addr != current_client:
         sock.sendto(b"ACK ERROR BUSY (another UDP client)", addr)
-        print(f"[!] Rejected UDP client {addr} (busy with another UDP client)")
         return current_client, handler, False
 
+    handler.update_activity()
+    process_udp_command(handler, cmd, args)
+
+    return current_client, handler, False
