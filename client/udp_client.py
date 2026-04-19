@@ -127,173 +127,110 @@ class UDPClient:
         return num
 
     def send_file(self, filename, filesize, offset=0):
-        """
-        Надёжная отправка файла по UDP с попытками восстановления.
-        Если сервер сообщает, что у него уже есть часть файла, клиент подстраивается.
-        """
-        # Сначала запросим сервер, чтобы узнать ожидаемое смещение
-        server_offset, raw = self._query_server_offset(filename, filesize, offset)
-        if server_offset is None:
-            # если сервер вернул ошибку с указанием ожидаемого смещения в байтах,
-            # _query_server_offset попытается вернуть число; если нет — пробуем продолжить с offset
-            # но лучше попытаться ещё раз с небольшим ожиданием
-            try:
-                time.sleep(0.01)
-                server_offset, raw = self._query_server_offset(filename, filesize, offset)
-            except Exception:
-                server_offset = None
+        server_offset, _ = self._query_server_offset(filename, filesize, offset)
 
         if server_offset is not None and server_offset != offset:
-            # сервер ожидает докачку с другого смещения — подстроимся
-            print(f"[UDP upload] server expects offset {server_offset}, client had {offset} → resuming")
+            print(f"[UDP upload] server expects offset {server_offset}, resuming")
             offset = server_offset
 
         base = offset // UDP_DATA_SIZE
         next_seq = base
         last_ack = base - 1
 
-        pack = struct.Struct('!I').pack
         total_packets = (filesize + UDP_DATA_SIZE - 1) // UDP_DATA_SIZE
 
-        batch = []
         retries = 0
-        MAX_RETRIES_LOCAL = MAX_RETRIES
-
         start_time = time.time()
         last_progress = start_time
 
-        # диагностические счётчики
+        # 📦 window cache (seq -> bytes)
+        window_cache = {}
+
+        # 🔥 единый буфер пакета (zero-copy)
+        packet_buf = bytearray(UDP_HEADER_SIZE + UDP_DATA_SIZE)
+        mv = memoryview(packet_buf)
+
         packets_sent = 0
         packets_retransmitted = 0
         bytes_payload_sent = 0
 
-        # Открываем файл и позиционируемся на offset
         with open(filename, 'rb') as f:
             f.seek(offset)
 
             while last_ack < total_packets - 1:
-                # наполняем окно пакетами
+
+                # ================= SEND =================
                 while next_seq < base + WINDOW_SIZE and next_seq < total_packets:
                     data = f.read(UDP_DATA_SIZE)
                     if not data:
                         break
-                    pkt = pack(next_seq) + data
-                    batch.append((next_seq, pkt))
+
+                    # header
+                    struct.pack_into('!I', packet_buf, 0, next_seq)
+
+                    # payload (zero-copy)
+                    mv[UDP_HEADER_SIZE:UDP_HEADER_SIZE+len(data)] = data
+
+                    pkt = bytes(mv[:UDP_HEADER_SIZE + len(data)])  # сохраняем в cache
+
+                    window_cache[next_seq] = pkt
+                    self.sock.sendto(pkt, self.addr)
+
+                    packets_sent += 1
+                    bytes_payload_sent += len(data)
+
                     next_seq += 1
 
-                    if len(batch) >= BATCH_SIZE:
-                        for _, pkt in batch:
-                            self.sock.sendto(memoryview(pkt), self.addr)
-                            packets_sent += 1
-                            bytes_payload_sent += len(pkt) - UDP_HEADER_SIZE
-                        batch.clear()
-
-                # flush remaining
-                for _, pkt in batch:
-                    self.sock.sendto(memoryview(pkt), self.addr)
-                    packets_sent += 1
-                    bytes_payload_sent += len(pkt) - UDP_HEADER_SIZE
-                batch.clear()
-
-                # ACK drain через select с лимитом
+                # ================= RECV ACK (фиксированный drain) =================
                 got_ack = False
-                drain_deadline = time.time() + 0.01
-                acks_processed = 0
-                MAX_ACKS_PER_ITER = 256
 
-                while time.time() < drain_deadline and acks_processed < MAX_ACKS_PER_ITER:
-                    r, _, _ = select.select([self.sock], [], [], max(0, drain_deadline - time.time()))
-                    if not r:
-                        break
+                for _ in range(512):   # 🔥 вместо бесконечного while
                     try:
                         ack_data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE)
+                    except BlockingIOError:
+                        break
                     except socket.timeout:
                         break
-                    # ожидаем текстовый ACK
-                    try:
-                        text = ack_data.decode('utf-8', errors='ignore').strip()
-                    except:
+
+                    if len(ack_data) != 4:
                         continue
-                    if not text.startswith('ACK'):
-                        continue
-                    # форматы: "ACK <seq>" или "ACK OK <seq>"
-                    parts = text.split()
-                    seq_val = None
-                    for p in parts[::-1]:
-                        try:
-                            seq_val = int(p)
-                            break
-                        except:
-                            continue
-                    if seq_val is None:
-                        continue
-                    ack_seq = seq_val
+
+                    ack_seq = struct.unpack('!I', ack_data)[0]
+
                     if ack_seq > last_ack:
+                        # удаляем подтверждённые пакеты
+                        while base < ack_seq:
+                            window_cache.pop(base, None)
+                            base += 1
+
                         last_ack = ack_seq
-                        base = ack_seq
                         retries = 0
                         last_progress = time.time()
                         got_ack = True
-                    acks_processed += 1
 
-                # если не получили ACK — попытка контролируемой повторной отправки
+                # ================= RETRANSMIT =================
                 if not got_ack:
                     retries += 1
-                    # перед повторной отправкой попробуем опросить сервер о текущем смещении
-                    server_offset_bytes, _ = self._query_server_offset(filename, filesize, base * UDP_DATA_SIZE)
-                    if server_offset_bytes is not None:
-                        # если сервер продвинулся — синхронизируемся
-                        if server_offset_bytes // UDP_DATA_SIZE > base:
-                            new_base = server_offset_bytes // UDP_DATA_SIZE
-                            print(f"[UDP upload] server reports progress → new base {new_base}")
-                            base = new_base
-                            last_ack = base - 1
-                            f.seek(base * UDP_DATA_SIZE)
-                            next_seq = base
-                            retries = 0
-                            continue
 
-                    # resend half-window starting from base
-                    resend_end = min(base + max(1, WINDOW_SIZE // 2), total_packets)
-                    f.seek(base * UDP_DATA_SIZE)
+                    resend_end = min(base + 32, total_packets)
+
                     for seq in range(base, resend_end):
-                        data = f.read(UDP_DATA_SIZE)
-                        if not data:
-                            break
-                        pkt = pack(seq) + data
-                        self.sock.sendto(pkt, self.addr)
-                        packets_retransmitted += 1
-                        packets_sent += 1
-                        bytes_payload_sent += len(pkt) - UDP_HEADER_SIZE
+                        pkt = window_cache.get(seq)
+                        if pkt:
+                            self.sock.sendto(pkt, self.addr)
+                            packets_retransmitted += 1
+                            packets_sent += 1
+                            bytes_payload_sent += len(pkt) - UDP_HEADER_SIZE
 
-                    # мягкий backoff
-                    time.sleep(min(0.01 * (1.5 ** retries), 0.5))
-
-                # fail-safe: если слишком много повторов — пробуем полностью переинициализировать сессии
-                if retries > MAX_RETRIES_LOCAL // 2:
-                    # повторно запросим сервер текущее ожидаемое смещение и подстроимся
-                    server_offset_bytes, resp = self._query_server_offset(filename, filesize, base * UDP_DATA_SIZE)
-                    if server_offset_bytes is not None and server_offset_bytes != base * UDP_DATA_SIZE:
-                        print(f"[UDP upload] resync with server offset {server_offset_bytes}")
-                        base = server_offset_bytes // UDP_DATA_SIZE
-                        last_ack = base - 1
-                        f.seek(base * UDP_DATA_SIZE)
-                        next_seq = base
-                        retries = 0
-                        continue
-
-                if retries > MAX_RETRIES_LOCAL:
-                    print("[UDP upload] too many retries → abort")
+                if retries > MAX_RETRIES:
                     raise TimeoutError("Too many retransmissions")
 
                 if time.time() - last_progress > 30:
-                    print("[UDP upload] stalled → abort")
                     raise TimeoutError("UDP upload stalled")
 
         elapsed = time.time() - start_time
         speed = filesize / elapsed / 1024 if elapsed > 0 else None
 
-        # диагностический вывод
         print(f"[UDP upload] packets_sent={packets_sent} retrans={packets_retransmitted} bytes_payload={bytes_payload_sent}")
         return speed
 

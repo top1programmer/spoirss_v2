@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#client/main_client.py
 from tcp_client import *
 from udp_client import UDPClient
 from common.config import *
@@ -106,6 +107,7 @@ def main():
         except Exception:
             pass
         sock.settimeout(UDP_TIMEOUT)
+        sock.setblocking(False)
 
     try:
         if args.protocol == 'tcp':
