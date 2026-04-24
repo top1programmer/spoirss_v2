@@ -1,212 +1,325 @@
-#!/usr/bin/env python3
-import argparse
-import select
+# server/tcp_server.py
+import os
+import shlex
 import socket
+import time
 
-from common.config import PORT
-from server.tcp_server import TCPClient
-from server.udp_server import udp_server_loop
-
-
-def setup_keepalive(sock):
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-    except AttributeError:
-        pass
+from common.config import *
 
 
-def clean_dirs():
-    import os
-    from common.config import INCOMPLETE_DIR, UPLOAD_DIR
-
-    os.makedirs(INCOMPLETE_DIR, exist_ok=True)
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    for name in os.listdir(INCOMPLETE_DIR):
-        os.remove(os.path.join(INCOMPLETE_DIR, name))
+def send_ok_tcp(sock, msg=''):
+    sock.sendall(f"OK {msg}\r\n".encode())
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Сервер для передачи файлов (TCP+UDP одновременно)'
-    )
-
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=PORT,
-        help='Порт для прослушивания'
-    )
-
-    return parser.parse_args()
+def send_error_tcp(sock, msg):
+    sock.sendall(f"ERROR {msg}\r\n".encode())
 
 
-def create_tcp_socket(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+class TCPClient:
+    def __init__(self, conn, addr):
+        self.conn = conn
+        self.addr = addr
+        self.buffer = b''
 
-    setup_keepalive(sock)
+        self.conn.setblocking(False)
+        print(f"[+] TCP client {addr} connected")
 
-    sock.bind(('0.0.0.0', port))
-    sock.listen(5)
-    sock.setblocking(False)
+    def fileno(self):
+        return self.conn.fileno()
 
-    return sock
+    def close(self):
+        self.conn.close()
+        print(f"[-] TCP client {self.addr} disconnected")
 
+    def handle_input(self):
+        try:
+            data = self.conn.recv(1024)
+        except socket.error:
+            return False
 
-def tune_udp_buffers(sock):
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)
-    except Exception:
-        pass
+        if not data:
+            return False
 
+        self.buffer += data
 
-def print_udp_buffers(sock):
-    snd = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
-    rcv = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-    print(snd, rcv)
+        if b'\n' not in self.buffer:
+            return True
 
+        line = self.extract_line()
+        return self.process_line(line)
 
-def create_udp_socket(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    def extract_line(self):
+        line, self.buffer = self.buffer.split(b'\n', 1)
+        return line
 
-    tune_udp_buffers(sock)
-    print_udp_buffers(sock)
+    def process_line(self, raw_line):
+        line = self.decode_line(raw_line)
 
-    sock.bind(('0.0.0.0', port))
-    sock.setblocking(False)
+        if line is None:
+            return True
 
-    return sock
+        should_close = self.is_close_command(line)
+        self.process_command(line)
 
+        return not should_close
 
-def build_read_list(tcp_listen, udp_sock, tcp_clients):
-    sockets = [tcp_listen, udp_sock]
+    def decode_line(self, raw_line):
+        try:
+            return raw_line.decode('utf-8').strip()
+        except UnicodeDecodeError:
+            self.send_error("invalid text command")
+            return None
 
-    if tcp_clients:
-        sockets.append(tcp_clients[0])
-
-    return sockets
-
-
-def reject_tcp_client(conn, addr):
-    setup_keepalive(conn)
-
-    try:
-        conn.sendall(
-            b"BUSY: server is handling another TCP client. Try later.\r\n"
+    def is_close_command(self, line):
+        upper = line.upper()
+        return (
+            upper.startswith('CLOSE') or
+            upper.startswith('EXIT') or
+            upper.startswith('QUIT')
         )
-    except Exception:
-        pass
 
-    conn.close()
-    print(f"[!] Rejected TCP connection from {addr} (busy)")
+    def process_command(self, line):
+        print(f"[TCP command] {self.addr}: {line}")
 
+        cmd, args = self.parse_command(line)
 
-def accept_tcp_client(tcp_listen, tcp_clients):
-    conn, addr = tcp_listen.accept()
+        if cmd in ('CLOSE', 'EXIT', 'QUIT'):
+            self.send_bye()
+            return
 
-    if tcp_clients:
-        reject_tcp_client(conn, addr)
-        return
+        if cmd == 'ECHO':
+            self.handle_echo(args)
+            return
 
-    setup_keepalive(conn)
-    tcp_clients.append(TCPClient(conn, addr))
+        if cmd == 'TIME':
+            self.handle_time()
+            return
 
+        if cmd == 'UPLOAD':
+            self.handle_upload(args)
+            return
 
-def process_udp(udp_sock, udp_current_client, udp_handler, is_tcp_busy):
-    return udp_server_loop(
-        udp_sock,
-        udp_current_client,
-        udp_handler,
-        is_tcp_busy
-    )
+        if cmd == 'DOWNLOAD':
+            self.handle_download(args)
+            return
 
+        self.send_error("unknown command")
 
-def process_tcp_client(tcp_clients):
-    client = tcp_clients[0]
+    def parse_command(self, line):
+        parts = line.split(maxsplit=1)
 
-    if client.handle_input():
-        return
+        cmd = parts[0].upper()
+        args = parts[1] if len(parts) > 1 else ''
 
-    client.close()
-    tcp_clients.pop()
+        return cmd, args
 
+    def send_error(self, msg):
+        send_error_tcp(self.conn, msg)
 
-def process_socket(
-    sock,
-    tcp_listen,
-    udp_sock,
-    tcp_clients,
-    udp_current_client,
-    udp_handler
-):
-    is_tcp_busy = bool(tcp_clients)
+    def send_ok(self, msg=''):
+        send_ok_tcp(self.conn, msg)
 
-    if sock is tcp_listen:
-        accept_tcp_client(tcp_listen, tcp_clients)
-        return udp_current_client, udp_handler
+    def send_bye(self):
+        self.conn.sendall(b"BYE\r\n")
 
-    if sock is udp_sock:
-        udp_current_client, udp_handler, _ = process_udp(
-            udp_sock,
-            udp_current_client,
-            udp_handler,
-            is_tcp_busy
+    def handle_echo(self, args):
+        if not args:
+            self.send_error("missing argument")
+            return
+
+        self.conn.sendall(f"{args}\r\n".encode())
+
+    def handle_time(self):
+        current = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.sendall(f"{current}\r\n".encode())
+
+    def handle_upload(self, args):
+        params = self.parse_upload_args(args)
+
+        if not params:
+            return
+
+        filename, filesize, offset = params
+
+        temp_path = os.path.join(INCOMPLETE_DIR, filename)
+        final_path = os.path.join(UPLOAD_DIR, filename)
+
+        current_size = self.prepare_upload_file(temp_path)
+
+        if not self.validate_upload_sizes(current_size, offset, filesize):
+            return
+
+        self.send_ok(str(current_size))
+
+        if not self.receive_upload_data(temp_path, filesize, current_size):
+            return
+
+        os.rename(temp_path, final_path)
+        self.send_upload_complete(filesize, offset)
+
+    def parse_upload_args(self, args):
+        try:
+            parts = shlex.split(args)
+        except ValueError as e:
+            self.send_error(f"invalid args: {e}")
+            return None
+
+        if len(parts) < 2:
+            self.send_error("need filename and size")
+            return None
+
+        filename = parts[0]
+
+        try:
+            filesize = int(parts[1])
+        except ValueError:
+            self.send_error("invalid size")
+            return None
+
+        offset = int(parts[2]) if len(parts) > 2 else 0
+        return filename, filesize, offset
+
+    def prepare_upload_file(self, path):
+        if os.path.exists(path):
+            return os.path.getsize(path)
+
+        open(path, 'wb').close()
+        return 0
+
+    def validate_upload_sizes(self, current_size, offset, filesize):
+        if current_size != offset:
+            self.send_error(f"expected offset {current_size}")
+            return False
+
+        if filesize < offset:
+            self.send_error("offset > filesize")
+            return False
+
+        return True
+
+    def receive_upload_data(self, path, filesize, received):
+        self.conn.settimeout(TCP_TIMEOUT)
+
+        try:
+            with open(path, 'ab') as f:
+                while received < filesize:
+                    chunk = self.read_upload_chunk(filesize, received)
+
+                    if chunk is None:
+                        continue
+
+                    if not chunk:
+                        raise ConnectionError("Connection lost")
+
+                    f.write(chunk)
+                    received += len(chunk)
+
+        except Exception as e:
+            print(f"[!] Upload from {self.addr} interrupted: {e}")
+            self.conn.settimeout(None)
+            return False
+
+        self.conn.settimeout(None)
+        return True
+
+    def read_upload_chunk(self, filesize, received):
+        try:
+            size = min(BUFFER_SIZE, filesize - received)
+            return self.conn.recv(size)
+        except socket.timeout:
+            return None
+
+    def send_upload_complete(self, filesize, offset):
+        speed = self.calc_speed(filesize - offset)
+        self.conn.sendall(
+            f"UPLOAD complete. Speed: {speed:.2f} KB/s\r\n".encode()
         )
-        return udp_current_client, udp_handler
 
-    if tcp_clients and sock is tcp_clients[0]:
-        process_tcp_client(tcp_clients)
+    def handle_download(self, args):
+        params = self.parse_download_args(args)
 
-    return udp_current_client, udp_handler
+        if not params:
+            return
 
+        filename, offset = params
 
-def run_server_loop(tcp_listen, udp_sock):
-    tcp_clients = []
-    udp_current_client = None
-    udp_handler = None
+        filepath = os.path.join(UPLOAD_DIR, filename)
 
-    while True:
-        rlist = build_read_list(tcp_listen, udp_sock, tcp_clients)
-        readable, _, _ = select.select(rlist, [], [], 1.0)
+        if not os.path.exists(filepath):
+            self.send_error("file not found")
+            return
 
-        for sock in readable:
-            udp_current_client, udp_handler = process_socket(
-                sock,
-                tcp_listen,
-                udp_sock,
-                tcp_clients,
-                udp_current_client,
-                udp_handler
-            )
+        filesize = os.path.getsize(filepath)
 
+        if offset > filesize:
+            self.send_error("offset beyond file size")
+            return
 
-def main():
-    args = parse_args()
+        self.send_ok(f"{filesize} {offset}")
 
-    clean_dirs()
+        if not self.send_download_file(filepath, filesize, offset):
+            return
 
-    tcp_listen = create_tcp_socket(args.port)
-    udp_sock = create_udp_socket(args.port)
+        self.send_download_complete(filesize, offset)
 
-    print(f"[*] Server listening on port {args.port} (TCP and UDP)")
+    def parse_download_args(self, args):
+        try:
+            parts = shlex.split(args)
+        except ValueError as e:
+            self.send_error(f"invalid args: {e}")
+            return None
 
-    try:
-        run_server_loop(tcp_listen, udp_sock)
+        if not parts:
+            self.send_error("need filename")
+            return None
 
-    except KeyboardInterrupt:
-        print("\n[!] Server stopped by user")
+        filename = parts[0]
+        offset = int(parts[1]) if len(parts) > 1 else 0
 
-    finally:
-        tcp_listen.close()
-        udp_sock.close()
+        return filename, offset
 
+    def send_download_file(self, filepath, filesize, offset):
+        self.conn.settimeout(TCP_TIMEOUT)
+        sent = offset
 
-if __name__ == '__main__':
-    main()
+        try:
+            with open(filepath, 'rb') as f:
+                f.seek(offset)
+
+                while sent < filesize:
+                    chunk = f.read(BUFFER_SIZE)
+
+                    if not chunk:
+                        break
+
+                    self.conn.sendall(chunk)
+                    sent += len(chunk)
+
+        except Exception as e:
+            print(f"[!] Download to {self.addr} interrupted: {e}")
+            self.conn.settimeout(None)
+            return False
+
+        self.conn.settimeout(None)
+        return True
+
+    def send_download_complete(self, filesize, offset):
+        speed = self.calc_speed(filesize - offset)
+
+        self.conn.sendall(
+            f"DOWNLOAD complete. Speed: {speed:.2f} KB/s\r\n".encode()
+        )
+
+    def calc_speed(self, size):
+        now = time.time()
+
+        if not hasattr(self, '_speed_start'):
+            self._speed_start = now
+
+        elapsed = now - self._speed_start
+        self._speed_start = now
+
+        if elapsed <= 0:
+            return 0
+
+        return size / elapsed / 1024
