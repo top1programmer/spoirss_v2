@@ -81,7 +81,7 @@ class UDPClient:
         base = offset // UDP_DATA_SIZE
         next_seq = base
         last_ack = base - 1
-
+        
         total = self.packet_count(filesize)
 
         retries = 0
@@ -103,7 +103,7 @@ class UDPClient:
                 next_seq, sent = self.send_window( f, cache, mv, base, next_seq, total)
                 sent_packets += sent
                 ack = self.read_upload_ack(last_ack)
-
+                
                 if ack > last_ack:
                     base = self.slide_window( cache,  base, ack )
                     last_ack = ack
@@ -112,8 +112,10 @@ class UDPClient:
 
                 else:
                     retries += 1
-                    resent = self.resend_window( cache, base, total )
-                    resent_packets += resent
+
+                    if retries % 5 == 0:
+                        resent = self.resend_window(cache, base, total)
+                        resent_packets += resent
 
                 self.check_upload_timeout( retries, last_progress )
 
@@ -137,7 +139,8 @@ class UDPClient:
 
             if packet is None:
                 break
-
+            if count % 128 == 0:
+                time.sleep(0)
             self.sendto(packet)
 
             next_seq += 1
@@ -165,25 +168,25 @@ class UDPClient:
         mv[UDP_HEADER_SIZE:UDP_HEADER_SIZE + len(data)] = data
 
         return bytes( mv[ :UDP_HEADER_SIZE + len(data) ] )
-
+   
     def read_upload_ack(self, last_ack):
-        for _ in range(512):
+        best = last_ack
+        old = self.sock.gettimeout()
+        self.sock.settimeout(0.01)
+
+        for _ in range(2048):
             try:
                 data, _ = self.recvfrom()
-            except BlockingIOError:
-                break
             except socket.timeout:
                 break
 
-            if len(data) != 4:
-                continue
+            if len(data) == 4:
+                ack = struct.unpack('!I', data)[0]
+                if ack > best:
+                    best = ack
 
-            ack = struct.unpack('!I', data)[0]
-
-            if ack > last_ack:
-                return ack
-
-        return last_ack
+        self.sock.settimeout(old)
+        return best
 
     def slide_window(self, cache, base, ack):
         while base < ack:
@@ -215,64 +218,57 @@ class UDPClient:
     # ==========================================================
     # download
     # ==========================================================
-    def receive_file( self, filename, filesize, offset=0 ):
+    def receive_file(self, filename, filesize, offset=0):
         base = offset // UDP_DATA_SIZE
         total = self.packet_count(filesize)
 
-        received = [None] * WINDOW_SIZE
+        received = {}   # вместо списка
 
         retries = 0
         last_progress = time.time()
-        last_acked = base
         start_time = time.time()
-
         packets = 0
 
-        with open( filename, 'ab' if offset else 'wb' ) as f:
+        with open(filename, 'ab' if offset else 'wb') as f:
             f.seek(offset)
-
-            buf = io.BufferedWriter( f, buffer_size=BUFFER_SIZE )
+            buf = io.BufferedWriter(f, buffer_size=BUFFER_SIZE)
 
             while base < total:
-                base, got, count = self.read_packets( received, buf, base )
+                base, got, count = self.read_packets(received, buf, base)
 
                 packets += count
+
                 if got:
                     retries = 0
                     last_progress = time.time()
                 else:
                     retries += 1
 
-                last_acked = self.send_ack_if_needed( base, last_acked )
-
-                self.send_keepalive_ack(base)
-                self.check_download_timeout( retries, last_progress )
+                self.check_download_timeout(retries, last_progress)
 
             buf.flush()
 
         self.send_final_acks(base)
 
-        speed = self.calc_speed( filesize - offset, start_time )
-        print( f"[UDP download] packets={packets}" )
+        speed = self.calc_speed(filesize - offset, start_time)
+        print(f"[UDP download] packets={packets}")
 
         return speed
 
-    def read_packets( self, received, buf, base ):
+    def read_packets(self, received, buf, base):
         got = False
         count = 0
 
-        for _ in range(512):
+        while True:
             try:
                 data, _ = self.recvfrom()
-            except BlockingIOError:
-                break
             except socket.timeout:
                 break
 
             if len(data) < 4:
                 continue
 
-            seq = struct.unpack( '!I', data[:4] )[0]
+            seq = struct.unpack('!I', data[:4])[0]
 
             if seq < base:
                 continue
@@ -280,16 +276,20 @@ class UDPClient:
             if seq >= base + WINDOW_SIZE:
                 continue
 
-            idx = seq % WINDOW_SIZE
-
-            if received[idx] is None:
-                received[idx] = data[4:]
+            if seq not in received:
+                received[seq] = data[4:]
                 count += 1
 
-            base, moved = self.flush_window( received, buf, base )
+            moved = False
+
+            while base in received:
+                buf.write(received.pop(base))
+                base += 1
+                moved = True
 
             if moved:
                 got = True
+                self.send_ack(base)   # ACK сразу при продвижении окна
 
         return base, got, count
 
@@ -311,7 +311,7 @@ class UDPClient:
         return base, moved
 
     def send_ack_if_needed( self, base, last_acked ):
-        if base - last_acked < 32:
+        if base - last_acked < 128:
             return last_acked
 
         self.send_ack(base)

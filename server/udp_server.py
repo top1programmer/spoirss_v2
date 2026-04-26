@@ -23,8 +23,8 @@ class UDPServer:
     # ==========================================================
     def setup_buffers(self):
         try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024 * 1024)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024 * 1024)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024 * 1024)
         except Exception:
             pass
 
@@ -216,43 +216,76 @@ class UDPServer:
             return None
 
     def send_download_file(self, filepath, filesize, offset):
-        start_seq = offset // UDP_DATA_SIZE
-        total_packets = self.packet_count(filesize)
+        base = offset // UDP_DATA_SIZE
+        next_seq = base
+        last_ack = base - 1
 
-        base = start_seq
-        next_seq = start_seq
+        total = self.packet_count(filesize)
+
         retries = 0
-        last_progress = time.time()
+        start_time = time.time()
+        last_progress = start_time
 
         cache = {}
+
         packet_buf = bytearray(UDP_HEADER_SIZE + UDP_DATA_SIZE)
         mv = memoryview(packet_buf)
 
-        start_time = time.time()
+        sent_packets = 0
+        resent_packets = 0
+
+        BURST = 128
 
         with open(filepath, 'rb') as f:
             f.seek(offset)
 
-            while base < total_packets:
-                next_seq = self.send_window(
-                    f, cache, mv, base, next_seq, total_packets
-                )
+            while last_ack < total - 1:
 
-                ack = self.read_ack(base)
+                # send only burst packets
+                limit = min(next_seq + BURST, base + WINDOW_SIZE, total)
 
-                if ack > base:
-                    base = self.slide_window(cache, base, ack)
+                while next_seq < limit:
+
+                    if next_seq not in cache:
+                        packet = self.build_packet(f, mv, next_seq)
+                        if packet is None:
+                            break
+                        cache[next_seq] = packet
+
+                    self.sendto(cache[next_seq])
+
+                    next_seq += 1
+                    sent_packets += 1
+
+                # immediately read ACK
+                ack = self.read_ack(last_ack)
+
+                if ack > last_ack:
+                    while base < ack:
+                        cache.pop(base, None)
+                        base += 1
+
+                    last_ack = ack
                     retries = 0
                     last_progress = time.time()
+
                 else:
                     retries += 1
-                    self.resend_window(cache, base, next_seq)
+
+                    # resend first lost packets
+                    end = min(base + 32, total)
+
+                    for seq in range(base, end):
+                        packet = cache.get(seq)
+                        if packet:
+                            self.sendto(packet)
+                            resent_packets += 1
 
                 if retries > MAX_RETRIES:
                     print("[UDP download] aborted")
                     return
 
-                if time.time() - last_progress > 30:
+                if time.time() - last_progress > 15:
                     print("[UDP download] stalled")
                     return
 
@@ -260,26 +293,30 @@ class UDPServer:
         speed = (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
 
         self.sendto(
-            f"DOWNLOAD complete. Speed: {speed:.0f} KB/s".encode()
+            f"DOWNLOAD complete. Speed: {speed:.2f} KB/s".encode()
         )
 
-        print(
-            f"[UDP download] FINISHED {speed:.0f} KB/s "
-            f"for {self.client_addr}"
-        )
+        print(f"[UDP download] packets={sent_packets} retrans={resent_packets}")
 
     def send_window(self, f, cache, mv, base, next_seq, total):
-        while next_seq < base + WINDOW_SIZE and next_seq < total:
+        limit = min(base + WINDOW_SIZE, total)
+
+        count = 0
+
+        while next_seq < limit:
             if next_seq not in cache:
                 packet = self.build_packet(f, mv, next_seq)
-
                 if not packet:
                     break
-
                 cache[next_seq] = packet
 
             self.sendto(cache[next_seq])
+
             next_seq += 1
+            count += 1
+
+            if count % 128 == 0:
+                time.sleep(0)
 
         return next_seq
 
@@ -294,8 +331,13 @@ class UDPServer:
 
         return bytes(mv[:UDP_HEADER_SIZE + len(data)])
 
-    def read_ack(self, base):
-        for _ in range(512):
+    def read_ack(self, last_ack):
+        best = last_ack
+
+        old = self.sock.gettimeout()
+        self.sock.settimeout(0.01)
+
+        for _ in range(4096):
             packet = self.recv_packet()
 
             if not packet:
@@ -311,10 +353,11 @@ class UDPServer:
 
             ack = struct.unpack('!I', data)[0]
 
-            if ack > base:
-                return ack
+            if ack > best:
+                best = ack
 
-        return base
+        self.sock.settimeout(old)
+        return best
 
     def slide_window(self, cache, base, ack):
         while base < ack:
@@ -324,7 +367,7 @@ class UDPServer:
         return base
 
     def resend_window(self, cache, base, next_seq):
-        end = min(base + 32, next_seq)
+        end = min(base + 256, next_seq)
 
         for seq in range(base, end):
             packet = cache.get(seq)
@@ -359,7 +402,6 @@ def create_udp_session(sock, addr):
     print(f"[+] UDP client {addr} started session")
     return addr, UDPServer(sock, addr)
 
-
 def process_udp_command(handler, cmd, args):
     if cmd == 'UPLOAD':
         handler.handle_upload(args)
@@ -386,13 +428,17 @@ def udp_server_loop(sock, current_client, handler, is_busy):
 
     line = decode_udp(data)
 
-    if line is None:
+    if not line:
         return current_client, handler, False
 
     parts = line.split(maxsplit=1)
-
     cmd = parts[0].upper()
     args = parts[1] if len(parts) > 1 else ''
+
+    allowed = {"UPLOAD", "DOWNLOAD", "LIST", "DELETE"}
+
+    if cmd not in allowed:
+        return current_client, handler, False
 
     if current_client is None:
         current_client, handler = create_udp_session(sock, addr)
@@ -402,6 +448,17 @@ def udp_server_loop(sock, current_client, handler, is_busy):
         return current_client, handler, False
 
     handler.update_activity()
+
+    # transfer-команды вызываем напрямую
+    if cmd == "DOWNLOAD":
+        handler.handle_download(args)
+        return None, None, False
+
+    if cmd == "UPLOAD":
+        handler.handle_upload(args)
+        return None, None, False
+
+    # остальные команды
     process_udp_command(handler, cmd, args)
 
     return current_client, handler, False
