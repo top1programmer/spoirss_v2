@@ -12,3 +12,4 @@ spolks_linux_vmsis_2013-2014/**
 **/incomplete/
 **/uploads/
 click.code-workspace
+__pycache__/

@@ -215,11 +215,10 @@ class UDPServer:
             self.send_error("invalid args")
             return None
 
-    def send_download_file(self, filepath, filesize, offset):
+    def send_download_file(self, filepath, filesize, offset=0):
         base = offset // UDP_DATA_SIZE
         next_seq = base
         last_ack = base - 1
-
         total = self.packet_count(filesize)
 
         retries = 0
@@ -227,44 +226,26 @@ class UDPServer:
         last_progress = start_time
 
         cache = {}
-
         packet_buf = bytearray(UDP_HEADER_SIZE + UDP_DATA_SIZE)
         mv = memoryview(packet_buf)
 
         sent_packets = 0
         resent_packets = 0
 
-        BURST = 128
-
         with open(filepath, 'rb') as f:
             f.seek(offset)
 
             while last_ack < total - 1:
 
-                # send only burst packets
-                limit = min(next_seq + BURST, base + WINDOW_SIZE, total)
+                next_seq, sent = self.send_window(
+                    f, cache, mv, base, next_seq, total
+                )
+                sent_packets += sent
 
-                while next_seq < limit:
-
-                    if next_seq not in cache:
-                        packet = self.build_packet(f, mv, next_seq)
-                        if packet is None:
-                            break
-                        cache[next_seq] = packet
-
-                    self.sendto(cache[next_seq])
-
-                    next_seq += 1
-                    sent_packets += 1
-
-                # immediately read ACK
-                ack = self.read_ack(last_ack)
+                ack = self.read_download_ack(last_ack)
 
                 if ack > last_ack:
-                    while base < ack:
-                        cache.pop(base, None)
-                        base += 1
-
+                    base = self.slide_window(cache, base, ack)
                     last_ack = ack
                     retries = 0
                     last_progress = time.time()
@@ -272,22 +253,21 @@ class UDPServer:
                 else:
                     retries += 1
 
-                    # resend first lost packets
-                    end = min(base + 32, total)
-
-                    for seq in range(base, end):
-                        packet = cache.get(seq)
-                        if packet:
-                            self.sendto(packet)
-                            resent_packets += 1
+                    if retries % 5 == 0:
+                        resent = self.resend_download_window(
+                            cache, base, total
+                        )
+                        resent_packets += resent
 
                 if retries > MAX_RETRIES:
                     print("[UDP download] aborted")
                     return
 
-                if time.time() - last_progress > 15:
+                if time.time() - last_progress > 30:
                     print("[UDP download] stalled")
                     return
+
+        self.send_final_acks(base)
 
         elapsed = time.time() - start_time
         speed = (filesize - offset) / elapsed / 1024 if elapsed > 0 else 0
@@ -296,17 +276,62 @@ class UDPServer:
             f"DOWNLOAD complete. Speed: {speed:.2f} KB/s".encode()
         )
 
-        print(f"[UDP download] packets={sent_packets} retrans={resent_packets}")
+        print(
+            f"[UDP download] packets={sent_packets} "
+            f"retrans={resent_packets}"
+        )
 
-    def send_window(self, f, cache, mv, base, next_seq, total):
-        limit = min(base + WINDOW_SIZE, total)
+    def read_download_ack(self, last_ack):
+        best = last_ack
 
+        old = self.sock.gettimeout()
+        self.sock.settimeout(0.01)
+
+        for _ in range(2048):
+            packet = self.recv_packet()
+
+            if not packet:
+                break
+
+            data, addr = packet
+
+            if addr != self.client_addr:
+                continue
+
+            if len(data) != 4:
+                continue
+
+            ack = struct.unpack('!I', data)[0]
+
+            if ack > best:
+                best = ack
+
+        self.sock.settimeout(old)
+        return best
+
+    def resend_download_window(self, cache, base, total):
+        end = min(base + 32, total)
         count = 0
 
-        while next_seq < limit:
+        for seq in range(base, end):
+            packet = cache.get(seq)
+
+            if packet:
+                self.sendto(packet)
+                count += 1
+
+        return count
+
+    def send_window(self, f, cache, mv, base, next_seq, total):
+        count = 0
+
+        while next_seq < base + WINDOW_SIZE:
+            if next_seq >= total:
+                break
+
             if next_seq not in cache:
                 packet = self.build_packet(f, mv, next_seq)
-                if not packet:
+                if packet is None:
                     break
                 cache[next_seq] = packet
 
@@ -318,7 +343,7 @@ class UDPServer:
             if count % 128 == 0:
                 time.sleep(0)
 
-        return next_seq
+        return next_seq, count
 
     def build_packet(self, f, mv, seq):
         data = f.read(UDP_DATA_SIZE)
@@ -335,15 +360,15 @@ class UDPServer:
         best = last_ack
 
         old = self.sock.gettimeout()
-        self.sock.settimeout(0.01)
+        self.sock.settimeout(0.0)   # non-blocking
 
-        for _ in range(4096):
-            packet = self.recv_packet()
-
-            if not packet:
+        for _ in range(256):
+            try:
+                data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE)
+            except BlockingIOError:
                 break
-
-            data, addr = packet
+            except socket.timeout:
+                break
 
             if addr != self.client_addr:
                 continue

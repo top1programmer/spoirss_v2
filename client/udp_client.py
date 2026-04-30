@@ -113,7 +113,7 @@ class UDPClient:
                 else:
                     retries += 1
 
-                    if retries % 5 == 0:
+                    if retries % 8 == 0:
                         resent = self.resend_window(cache, base, total)
                         resent_packets += resent
 
@@ -139,7 +139,7 @@ class UDPClient:
 
             if packet is None:
                 break
-            if count % 128 == 0:
+            if count % 64 == 0:
                 time.sleep(0)
             self.sendto(packet)
 
@@ -172,7 +172,7 @@ class UDPClient:
     def read_upload_ack(self, last_ack):
         best = last_ack
         old = self.sock.gettimeout()
-        self.sock.settimeout(0.01)
+        self.sock.settimeout(0.03)
 
         for _ in range(2048):
             try:
@@ -289,7 +289,8 @@ class UDPClient:
 
             if moved:
                 got = True
-                self.send_ack(base)   # ACK сразу при продвижении окна
+            
+            self.send_ack(base)   # ACK сразу при продвижении окна
 
         return base, got, count
 
